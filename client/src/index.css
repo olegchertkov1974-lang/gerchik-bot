@@ -1,0 +1,53 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --primary: #5b5ea6;
+  --primary-light: #7c7fbf;
+  --primary-dark: #44478a;
+  --bg: #f0f2f5;
+  --bg-dark: #e4e6eb;
+  --sidebar-bg: #ffffff;
+  --chat-bg: #e5ddd5;
+  --message-own: #dcf8c6;
+  --message-other: #ffffff;
+  --text: #1a1a2e;
+  --text-light: #65676b;
+  --border: #e0e0e0;
+  --danger: #e74c3c;
+  --success: #2ecc71;
+  --online: #31a24c;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #ccc;
+  border-radius: 3px;
+}
+
+input, button, textarea {
+  font-family: inherit;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}

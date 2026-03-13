@@ -1,0 +1,15 @@
+{
+  "name": "messenger-app",
+  "version": "1.0.0",
+  "description": "Real-time messenger with React and Node.js",
+  "private": true,
+  "scripts": {
+    "server": "cd server && npm start",
+    "client": "cd client && npm start",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "install-all": "npm install && cd server && npm install && cd ../client && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

@@ -1,0 +1,159 @@
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: white;
+  border-radius: 16px;
+  width: 440px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+  font-size: 18px;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  color: var(--text-light);
+}
+
+.modal-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-tabs button {
+  flex: 1;
+  padding: 12px;
+  background: none;
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--text-light);
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+
+.modal-tabs button.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+}
+
+.search-input, .group-name-input {
+  margin: 12px 20px 0;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+}
+
+.search-input:focus, .group-name-input:focus {
+  border-color: var(--primary);
+}
+
+.selected-users {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 20px;
+}
+
+.selected-chip {
+  background: var(--primary);
+  color: white;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.user-results {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.user-result-item {
+  display: flex;
+  align-items: center;
+  padding: 10px 20px;
+  cursor: pointer;
+  gap: 12px;
+  transition: background 0.15s;
+}
+
+.user-result-item:hover {
+  background: #f5f5f5;
+}
+
+.user-result-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+}
+
+.user-result-info {
+  flex: 1;
+}
+
+.user-result-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.user-result-status {
+  font-size: 12px;
+  color: var(--text-light);
+}
+
+.check-mark {
+  color: var(--primary);
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.create-group-btn {
+  margin: 12px 20px;
+  padding: 12px;
+  background: var(--primary);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.create-group-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
