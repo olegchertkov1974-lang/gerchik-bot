@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#5b5ea6" />
+  <title>Messenger — Установить</title>
+
+  <!-- Open Graph для красивого превью в Telegram -->
+  <meta property="og:title" content="Messenger — Скачай мессенджер!" />
+  <meta property="og:description" content="Быстрый и удобный мессенджер. Личные сообщения, группы, файлы, поиск. Установи на телефон одним нажатием!" />
+  <meta property="og:image" content="/icon-512.png" />
+  <meta property="og:type" content="website" />
+
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #7c7fbf 0%, #5b5ea6 50%, #44478a 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: white;
+      border-radius: 24px;
+      padding: 40px 32px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+    }
+    .icon {
+      width: 96px;
+      height: 96px;
+      border-radius: 24px;
+      margin: 0 auto 20px;
+      box-shadow: 0 8px 24px rgba(91,94,166,0.3);
+    }
+    h1 { font-size: 28px; color: #1a1a2e; margin-bottom: 8px; }
+    .subtitle { color: #65676b; font-size: 15px; margin-bottom: 24px; line-height: 1.5; }
+    .features {
+      text-align: left;
+      margin-bottom: 28px;
+      padding: 0 8px;
+    }
+    .feature {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 0;
+      font-size: 14px;
+      color: #333;
+    }
+    .feature-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: #f0f0ff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+    .install-btn {
+      width: 100%;
+      padding: 16px;
+      background: #5b5ea6;
+      color: white;
+      border: none;
+      border-radius: 14px;
+      font-size: 17px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.15s, background 0.2s;
+      margin-bottom: 12px;
+    }
+    .install-btn:hover { background: #44478a; transform: scale(1.02); }
+    .install-btn:active { transform: scale(0.98); }
+    .install-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+    .open-btn {
+      width: 100%;
+      padding: 14px;
+      background: none;
+      color: #5b5ea6;
+      border: 2px solid #5b5ea6;
+      border-radius: 14px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .open-btn:hover { background: #f0f0ff; }
+    .hint {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #999;
+      line-height: 1.6;
+    }
+    .hidden { display: none; }
+    .installed-badge {
+      display: inline-block;
+      background: #e8f5e9;
+      color: #2e7d32;
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img src="/icon-192.png" alt="Messenger" class="icon" />
+    <h1>Messenger</h1>
+    <p class="subtitle">Быстрый и удобный мессенджер для общения с друзьями</p>
+
+    <div id="installed-badge" class="installed-badge hidden">Установлено!</div>
+
+    <div class="features">
+      <div class="feature"><div class="feature-icon">&#128172;</div> Личные сообщения и групповые чаты</div>
+      <div class="feature"><div class="feature-icon">&#128206;</div> Отправка файлов и изображений</div>
+      <div class="feature"><div class="feature-icon">&#128269;</div> Поиск по сообщениям и контактам</div>
+      <div class="feature"><div class="feature-icon">&#128276;</div> Мгновенные уведомления</div>
+      <div class="feature"><div class="feature-icon">&#9889;</div> Работает оффлайн</div>
+    </div>
+
+    <button id="installBtn" class="install-btn">Установить приложение</button>
+    <a href="/" class="open-btn" id="openBtn">Открыть в браузере</a>
+
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <script>
+    let deferredPrompt = null;
+    const installBtn = document.getElementById('installBtn');
+    const hint = document.getElementById('hint');
+    const badge = document.getElementById('installed-badge');
+
+    // Check if already installed
+    if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
+      badge.classList.remove('hidden');
+      installBtn.textContent = 'Уже установлено';
+      installBtn.disabled = true;
+    }
+
+    // Capture beforeinstallprompt
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      installBtn.textContent = 'Установить приложение';
+      installBtn.disabled = false;
+    });
+
+    installBtn.addEventListener('click', async () => {
+      if (deferredPrompt) {
+        deferredPrompt.prompt();
+        const { outcome } = await deferredPrompt.userChoice;
+        if (outcome === 'accepted') {
+          installBtn.textContent = 'Установлено!';
+          installBtn.disabled = true;
+          badge.classList.remove('hidden');
+        }
+        deferredPrompt = null;
+      } else {
+        // Fallback instructions
+        const ua = navigator.userAgent.toLowerCase();
+        if (/iphone|ipad/.test(ua)) {
+          hint.innerHTML = '<strong>iOS:</strong> Нажмите кнопку "Поделиться" <span style="font-size:18px">&#9757;</span> внизу Safari, затем "На экран Домой"';
+        } else if (/android/.test(ua)) {
+          hint.innerHTML = '<strong>Android:</strong> Нажмите меню (&#8942;) в браузере, затем "Добавить на главный экран"';
+        } else {
+          hint.innerHTML = 'Откройте эту страницу в Chrome или Safari на телефоне для установки как приложение';
+        }
+      }
+    });
+
+    window.addEventListener('appinstalled', () => {
+      installBtn.textContent = 'Установлено!';
+      installBtn.disabled = true;
+      badge.classList.remove('hidden');
+      deferredPrompt = null;
+    });
+  </script>
+</body>
+</html>
