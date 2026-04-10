@@ -1,0 +1,19 @@
+{
+  "name": "gerchik-levels-trading-bot",
+  "version": "2.0.0",
+  "description": "Crypto trading bot: Gerchik levels strategy + AI filter + n8n + Telegram for Bybit",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "test": "node test/test-strategy.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "ccxt": "^4.2.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
