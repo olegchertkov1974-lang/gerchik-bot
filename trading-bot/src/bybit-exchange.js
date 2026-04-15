@@ -157,6 +157,10 @@ class BybitExchange {
         this._toLinear(pair), orderType, side, amount, price, params
       );
 
+      // Нормализуем статус: Bybit Demo иногда возвращает undefined
+      if (!order.status) {
+        order.status = order.id ? 'open' : 'canceled';
+      }
       logger.info(`Ордер размещён: ${order.id} (${orderType}${postOnly ? ' PostOnly' : ''}) статус=${order.status}`);
       return order;
     }, `placeOrder(${pair}, ${side})`);
@@ -219,18 +223,14 @@ class BybitExchange {
         params.slTriggerBy = 'LastPrice';
       }
 
-      if (opts.takeProfit) {
-        params.takeProfit    = String(opts.takeProfit);
-        params.tpTriggerBy   = 'LastPrice';
+      // ВАЖНО: tpslMode=Partial не работает корректно — SL/TP не устанавливаются.
+      // Используем Full: SL защищает позицию целиком, TP закрывает весь остаток.
+      // К моменту TP3 бот уже закрыл TP1 (30%) и TP2 (40%) программно.
+      params.tpslMode = 'Full';
 
-        // Partial: TP закрывает только tpSize контрактов, а не всю позицию.
-        // Это защищает оставшийся объём, если TP1/TP2 не успели сработать ботом.
-        if (opts.tpSize) {
-          params.tpslMode = 'Partial';
-          params.tpSize   = String(opts.tpSize);
-        } else {
-          params.tpslMode = 'Full';
-        }
+      if (opts.takeProfit) {
+        params.takeProfit  = String(opts.takeProfit);
+        params.tpTriggerBy = 'LastPrice';
       }
 
       logger.info(

@@ -11,7 +11,7 @@
 
 const DEFAULT_RISK_PCT = 1;
 const MIN_RR_RATIO = 3;
-const MAX_RISK_PCT = 3;
+const MAX_RISK_PCT = 5;
 const MIN_RISK_PCT = 0.5;
 const MAX_CONCURRENT_POSITIONS = 3;
 

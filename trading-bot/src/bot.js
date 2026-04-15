@@ -8,7 +8,7 @@
  * Runs via CLI — no web interface.
  */
 
-require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env') });
+require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env'), override: true });
 
 const fs = require('fs');
 const path = require('path');
@@ -21,13 +21,31 @@ const WebhookServer = require('./webhook-server');
 const TradeStore = require('./trade-store');
 const logger = require('./logger');
 
-const PAIRS = [
-  'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
-  'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
-  'UNI/USDT', 'LTC/USDT', 'BCH/USDT', 'ATOM/USDT', 'FIL/USDT',
-  'NEAR/USDT', 'ARB/USDT', 'OP/USDT', 'INJ/USDT', 'SUI/USDT',
-  'APT/USDT', 'TIA/USDT', 'WLD/USDT', 'SAND/USDT', 'MANA/USDT', 'ALGO/USDT',
+// 50 пар для ежедневного скана волатильности (методология Герчика)
+const SCAN_PAIRS = [
+  'BTC/USDT',    'ETH/USDT',    'SOL/USDT',    'BNB/USDT',    'XRP/USDT',
+  'DOGE/USDT',   'ADA/USDT',    'AVAX/USDT',   'LINK/USDT',   'LTC/USDT',
+  'DOT/USDT',    'UNI/USDT',    'ATOM/USDT',   'NEAR/USDT',   'APT/USDT',
+  'ARB/USDT',    'OP/USDT',     'INJ/USDT',    'SUI/USDT',    'TRX/USDT',
+  'FTM/USDT',    'HBAR/USDT',   'ICP/USDT',    'VET/USDT',    'EOS/USDT',
+  'XLM/USDT',    'ALGO/USDT',   'SAND/USDT',   'MANA/USDT',   'AXS/USDT',
+  'RENDER/USDT', 'FET/USDT',    'WIF/USDT',    'SEI/USDT',    'TIA/USDT',
+  'JUP/USDT',    'PYTH/USDT',   'ZRO/USDT',    'STRK/USDT',   'ETHFI/USDT',
+  'ONDO/USDT',   'BLUR/USDT',   'GMX/USDT',    'PENDLE/USDT', 'AAVE/USDT',
+  'MKR/USDT',    'SNX/USDT',    'CRV/USDT',    'LDO/USDT',    'EIGEN/USDT',
 ];
+
+const DEFAULT_ACTIVE_PAIRS = [
+  'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
+  'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'LTC/USDT',
+];
+
+// Активные торговые пары — загружаются из .env ACTIVE_PAIRS, управляются через Telegram
+let PAIRS = (process.env.ACTIVE_PAIRS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+if (!PAIRS.length) PAIRS = [...DEFAULT_ACTIVE_PAIRS];
 // Герчик: 1D — уровни, 4H — подтверждение тренда, 5m — вход
 const TF_LEVELS = '1d';     // таймфрейм для построения уровней
 const TF_CONFIRM = '4h';    // таймфрейм для подтверждения тренда
@@ -37,7 +55,8 @@ const AI_FILTER_ENABLED = process.env.AI_FILTER_ENABLED !== 'false';
 const AI_MIN_CONFIDENCE = parseInt(process.env.AI_MIN_CONFIDENCE, 10) || 60;
 const ORDER_SAFETY_TTL_MS = 30 * 60 * 1000; // страховочный таймаут 30 мин
 const MAX_ORDER_ATTEMPTS = 2;                // макс попыток на один сетап
-const BREAKEVEN_ENABLED = true;              // перенос SL в безубыток после 1R
+const BREAKEVEN_ENABLED = true;
+const DAILY_LOSS_LIMIT_PCT = parseFloat(process.env.DAILY_LOSS_LIMIT_PCT) || 0; // 0 = выключено
 
 // ── Интервалы (мс) ──
 const INTERVAL_1M = 60 * 1000;              // базовый цикл — 1 минута
@@ -62,6 +81,7 @@ class TradingBot {
     this.paused = false;
     this.positions = new Map(); // pair -> position info (макс 1 на инструмент)
     this._pendingOrders = new Map(); // orderId -> { pair, position, signal, sizing, createdAt, attempts, level, direction }
+    this._pendingSLSetup = new Map(); // pair -> { pos, resolve } — ждём WS подтверждения позиции
     this._orderAttempts = new Map(); // pair -> количество попыток на текущий сетап
     this._dailyLevels = new Map();  // pair -> массив уровней с 1D
     this._lastReportDate = null;    // дата последнего отправленного отчёта (YYYY-MM-DD)
@@ -82,6 +102,10 @@ class TradingBot {
     // Мьютекс: orderId → Promise. Предотвращает двойную обработку одного fill
     // когда WS и REST polling одновременно видят исполненный ордер.
     this._processingOrders = new Map();
+
+    // Скан волатильности
+    this._lastVolatilityScanKey = null; // 'YYYY-MM-DD_H' — защита от двойного запуска
+    this._volatilityReport = null;      // последний отчёт {top10, timestamp, utcHour}
   }
 
   async start() {
@@ -284,6 +308,13 @@ class TradingBot {
 
     await this._setPositionStopLossAndTakeProfit(pending.pair, pending.position);
 
+    // Верификация через 10 сек: проверить SL/TP, TP1/TP2 на случай если всё не успело выставиться
+    setTimeout(() => {
+      this._verifyPositionState(pending.pair).catch(err =>
+        logger.warn(`${pending.pair}: ошибка верификации позиции: ${err.message}`)
+      );
+    }, 10000);
+
     await this.notifier.notifyTrade({
       ...pending.signal,
       positionSize: pending.sizing.size,
@@ -299,23 +330,31 @@ class TradingBot {
    * Обработка WS-события позиций (детекция закрытия по SL/TP).
    */
   _handleWsPositions(wsPositions) {
-    if (this.positions.size === 0) return;
-
     // Создаём Set пар, которые всё ещё открыты на бирже
     const openPairsOnExchange = new Set();
     for (const p of wsPositions) {
-      if (Math.abs(p.contracts || 0) > 0) {
+      const contracts = Math.abs(parseFloat(p.contracts || p.info?.size || 0));
+      if (contracts > 0) {
         const pair = p.symbol ? p.symbol.replace(':USDT', '') : '';
         openPairsOnExchange.add(pair);
+
+        // WS триггер: если эта пара ждёт выставления SL — немедленно резолвим
+        if (this._pendingSLSetup.has(pair)) {
+          const pending = this._pendingSLSetup.get(pair);
+          this._pendingSLSetup.delete(pair);
+          logger.info(`${pair}: WS подтвердил позицию (${contracts} контр.) — выставляем SL немедленно`);
+          pending.resolve('ws');
+        }
       }
     }
+
+    if (this.positions.size === 0) return;
 
     // Проверяем, исчезли ли наши позиции
     for (const [posKey] of this.positions) {
       const pair = posKey.split(':')[0];
       if (!openPairsOnExchange.has(pair)) {
         // Позиция закрыта — обработаем в следующем _detectClosedPositions()
-        // (WS может прийти раньше, чем данные о цене закрытия)
         logger.info(`WS: позиция ${pair} исчезла с биржи — будет обработана в следующем цикле`);
       }
     }
@@ -395,7 +434,7 @@ class TradingBot {
           size,
           orderId: 'synced',
           entryReason: 'Синхронизирована с биржи после рестарта',
-          openedAt: pos.timestamp ? new Date(pos.timestamp).toISOString() : new Date().toISOString(),
+          openedAt: pos.info?.createdTime ? new Date(parseInt(pos.info.createdTime)).toISOString() : (pos.timestamp ? new Date(pos.timestamp).toISOString() : new Date().toISOString()),
           _breakevenMoved: isBreakeven,
           _partialPnl: 0,
           _partialCloses: [],
@@ -964,6 +1003,7 @@ class TradingBot {
       ordersFilled: 0,
       ordersCancelled: 0,
       cancelReasons: { levelBreak: 0, timeout: 0, contextChange: 0, oppositeSignal: 0 },
+      marginFailures: 0,
       totalFees: 0,
       makerFees: 0,
       takerFees: 0,
@@ -1140,6 +1180,7 @@ class TradingBot {
         filled: this._dayStats.ordersFilled,
         cancelled: this._dayStats.ordersCancelled,
         cancelReasons: { ...this._dayStats.cancelReasons },
+        marginFailures: this._dayStats.marginFailures || 0,
       },
       daily: {
         netPnl: totalPnl - fees.total,
@@ -1172,6 +1213,7 @@ class TradingBot {
     this._dayStats = this._emptyDayStats();
     this._dayStats.balanceStart = currentBalance; // баланс на начало следующего дня
     this._saveDayStats();
+    this._dailyLossNotified = false; // сброс флага дневного лимита
   }
 
   stop() {
@@ -1229,6 +1271,21 @@ class TradingBot {
     if (this.positions.size > 0) {
       await this._checkTakeProfitLevels();
       this._lastBreakevenCheck = now;
+    }
+
+    // ── ДВАЖДЫ В ДЕНЬ: скан волатильности 06:00 UTC (09 МСК) и 12:00 UTC (15 МСК) ──
+    {
+      const _vH = new Date().getUTCHours();
+      const _vM = new Date().getUTCMinutes();
+      if ((_vH === 6 || _vH === 12) && _vM === 0) {
+        const _vK = `${new Date().toISOString().slice(0, 10)}_${_vH}`;
+        if (this._lastVolatilityScanKey !== _vK) {
+          this._lastVolatilityScanKey = _vK;
+          const _msk = _vH + 3;
+          logger.info(`[${utcTime}] ═══ Скан волатильности ${_vH}:00 UTC = ${_msk}:00 МСК ═══`);
+          this._volatilityScan().catch(e => logger.error(`VolatilityScan: ${e.message}`));
+        }
+      }
     }
 
     // ── РАЗ В СУТКИ: 1D уровни (после 00:00 UTC) ──
@@ -1339,6 +1396,154 @@ class TradingBot {
     logger.info(`Обновление уровней завершено: ${totalLevels} уровней по ${this._dailyLevels.size} парам`);
   }
 
+
+  /**
+   * Ежедневный скан волатильности 50 пар (методология Герчика).
+   * Запускается в 06:00 UTC и 12:00 UTC.
+   */
+  async _volatilityScan() {
+    const results = [];
+
+    for (const pair of SCAN_PAIRS) {
+      try {
+        const candles = await this.exchange.fetchCandles(pair, '1d', 16);
+        if (!candles || candles.length < 5) continue;
+
+        const currentPrice = candles[candles.length - 1].close;
+        if (!currentPrice || currentPrice <= 0) continue;
+
+        // ATR14
+        const slice14 = candles.slice(-15);
+        const trs = slice14.map((c, i) => {
+          if (i === 0) return c.high - c.low;
+          const prev = slice14[i - 1];
+          return Math.max(
+            c.high - c.low,
+            Math.abs(c.high - prev.close),
+            Math.abs(c.low - prev.close)
+          );
+        });
+        const atr14 = trs.reduce((a, b) => a + b, 0) / trs.length;
+        const atrPct = (atr14 / currentPrice) * 100;
+
+        // Вчерашний диапазон %
+        const yesterday = candles[candles.length - 2];
+        const rangePct = yesterday
+          ? ((yesterday.high - yesterday.low) / yesterday.close) * 100
+          : 0;
+
+        // Объём вчера vs средний за 14 дней
+        const avgVol = slice14.reduce((s, c) => s + (c.volume || 0), 0) / slice14.length;
+        const volRatio = avgVol > 0 && yesterday ? yesterday.volume / avgVol : 1;
+
+        // Есть ли уровень в радиусе 1% от цены
+        const pairLevels = this._dailyLevels.get(pair);
+        const hasNearLevel = pairLevels
+          ? pairLevels.levels.some(l => Math.abs(l.price - currentPrice) / currentPrice < 0.01)
+          : false;
+
+        // Composite score: ATR + диапазон + объём + близость уровня
+        const score =
+          atrPct * 0.4 +
+          rangePct * 0.3 +
+          Math.min(volRatio, 5) * 0.5 +
+          (hasNearLevel ? 1.5 : 0);
+
+        results.push({ pair, atrPct, rangePct, volRatio, hasNearLevel, score, price: currentPrice });
+      } catch (err) {
+        logger.debug(`volatilityScan ${pair}: ${err.message}`);
+      }
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    const top10 = results.slice(0, 10);
+
+    this._volatilityReport = {
+      top10,
+      all: results,
+      timestamp: new Date().toISOString(),
+      utcHour: new Date().getUTCHours(),
+    };
+
+    logger.info(
+      `Скан волатильности завершён: ${results.length} пар. ` +
+      `Топ-3: ${top10.slice(0, 3).map(r => `${r.pair}(${r.atrPct.toFixed(1)}%)`).join(', ')}`
+    );
+
+    await this.notifier.sendVolatilityReport(this._volatilityReport, PAIRS, this.positions);
+  }
+
+  /** Получить список активных торговых пар. */
+  getPairs() {
+    return [...PAIRS];
+  }
+
+  /**
+   * Добавить пару в активные (макс 10 выбранных пользователем).
+   * Позиционные пары (locked) не считаются в лимит.
+   */
+  addActivePair(pair) {
+    const selectedPairs = PAIRS.filter(p => !this.positions.has(p));
+    if (selectedPairs.length >= 10 && !PAIRS.includes(pair)) {
+      return { error: 'Уже 10 активных пар. Сначала убери одну.' };
+    }
+    if (!PAIRS.includes(pair)) {
+      PAIRS.push(pair);
+      this._saveActivePairs();
+      this._onboardNewPair(pair).catch(e => logger.error(`onboard ${pair}: ${e.message}`));
+      logger.info(`Пара добавлена в активные: ${pair}`);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Убрать пару из активных.
+   * Нельзя убрать если есть открытая позиция.
+   */
+  removeActivePair(pair) {
+    if (this.positions.has(pair)) {
+      return { error: `${pair}: открытая позиция — нельзя убрать` };
+    }
+    const idx = PAIRS.indexOf(pair);
+    if (idx !== -1) {
+      PAIRS.splice(idx, 1);
+      this._saveActivePairs();
+      logger.info(`Пара убрана из активных: ${pair}`);
+    }
+    return { ok: true };
+  }
+
+  /** Сохранить активные пары в .env (только незаблокированные позицией). */
+  _saveActivePairs() {
+    const selected = PAIRS.filter(p => !this.positions.has(p));
+    this.notifier._updateEnv('ACTIVE_PAIRS', selected.join(','));
+    logger.debug(`ACTIVE_PAIRS -> ${selected.join(', ')}`);
+  }
+
+  /** Загрузить данные для новой пары (уровни, 4H тренд, плечо). */
+  async _onboardNewPair(pair) {
+    logger.info(`Onboard новой пары: ${pair}`);
+    try {
+      const dailyCandles = await this.exchange.fetchCandles(pair, '1d', 120);
+      if (dailyCandles && dailyCandles.length >= 30) {
+        const levels = this.strategy.findLevels(dailyCandles);
+        this._dailyLevels.set(pair, { levels, candles: dailyCandles });
+        logger.info(`${pair}: загружено ${levels.length} уровней`);
+      }
+      const candles4H = await this.exchange.fetchCandles(pair, '4h', 50);
+      if (candles4H && candles4H.length >= 20) {
+        const trend = this.strategy.detectTrend4H(candles4H);
+        this._4hTrendCache.set(pair, { trend, candles: candles4H, updatedAt: Date.now() });
+        logger.info(`${pair}: 4H тренд = ${trend}`);
+      }
+      const lev = parseInt(process.env.LEVERAGE, 10) || 10;
+      await this.exchange.setLeverage(pair, lev);
+      logger.info(`${pair}: плечо ${lev}x установлено`);
+    } catch (err) {
+      logger.error(`_onboardNewPair ${pair}: ${err.message}`);
+    }
+  }
+
   /**
    * Мультитаймфреймовый анализ одной пары по методологии Герчика.
    * 1D → уровни, 4H → тренд и поведение, 5m → паттерн входа.
@@ -1422,17 +1627,40 @@ class TradingBot {
 
       if (!direction) continue;
 
-      // 8. Проверка тренда на 4H
+      // 8. Фильтр тренда по методологии Герчика (1D + 4H)
+      // Правила:
+      //   - Зеркальный уровень (mirror)  → можно против тренда, уменьшить объём
+      //   - Очень сильный уровень (>= 8) → можно против тренда, уменьшить объём
+      //   - Всё остальное против тренда  → пропуск
+      //   - Neutral тренд                → торгуем в обе стороны
+      const trend1D = this.strategy.detectTrend4H(dailyData.candles);
       const trend4H = this.strategy.detectTrend4H(candles4H);
-      const confirmation = this.strategy.check4HConfirmation(candles4H, direction);
-      if (!confirmation.confirmed && level.strength < 6) {
-        logger.info(`${pair}: 4H тренд [${trend4H}] противоречит ${direction} при слабом уровне ${level.price.toFixed(2)} (сила ${level.strength}) — пропуск`);
+
+      const trend1DConflict = (direction === 'long' && trend1D === 'down') || (direction === 'short' && trend1D === 'up');
+      const trend4HConflict = (direction === 'long' && trend4H === 'down') || (direction === 'short' && trend4H === 'up');
+      const isCounterTrend = trend1DConflict || trend4HConflict;
+
+      // Против тренда разрешено только на зеркальных или очень сильных уровнях
+      const counterTrendAllowed = level.isMirror || level.strength >= 8;
+
+      if (trend1DConflict && !counterTrendAllowed) {
+        logger.info(`${pair}: 1D тренд [${trend1D}] против ${direction} | ${level.classification} сила:${level.strength} — пропуск`);
         continue;
+      }
+      if (trend4HConflict && !counterTrendAllowed) {
+        logger.info(`${pair}: 4H тренд [${trend4H}] против ${direction} | ${level.classification} сила:${level.strength} — пропуск`);
+        continue;
+      }
+
+      // Против тренда на сильном/зеркальном уровне — уменьшить объём
+      const confirmation = { confirmed: true, reduce: isCounterTrend && counterTrendAllowed };
+      if (isCounterTrend) {
+        logger.info(`${pair}: ПРОТИВ ТРЕНДА (1D:${trend1D} 4H:${trend4H}) но уровень ${level.classification} сила:${level.strength} — объём уменьшен`);
       }
 
       // 9. Анализ поведения на 4H при подходе к уровню
       const approach = this.strategy.analyze4HApproach(candles4H, level);
-      logger.info(`${pair}: уровень ${level.price.toFixed(2)} в зоне! 4H тренд: ${trend4H}, подход: ${approach.approach}, направление: ${direction}`);
+      logger.info(`${pair}: уровень ${level.price.toFixed(2)} в зоне! 1D тренд: ${trend1D}, 4H тренд: ${trend4H}, подход: ${approach.approach}, направление: ${direction}`);
 
       // 10. Поиск паттерна входа на 5m
       const signal = this.strategy.findEntryPattern(candles5m, level, direction, dailyLevels);
@@ -1522,9 +1750,14 @@ class TradingBot {
                 const oldSL = pos.stopLoss;
                 const breakevenSL = pos.entry;
                 try {
+                  // tp3 валиден только если цена ещё не прошла его
+                  const validTp3 = pos.tp3 && (
+                    (pos.side === 'long'  && pos.tp3 > currentPrice) ||
+                    (pos.side === 'short' && pos.tp3 < currentPrice)
+                  );
                   await this.exchange.setTradingStop(pair, {
                     stopLoss:   breakevenSL,
-                    takeProfit: pos.tp3,
+                    ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
                     tpSize:     pos.size,  // остаток после закрытия TP1 (70%)
                     side:       pos.side,
                   });
@@ -1583,9 +1816,13 @@ class TradingBot {
 
                 // Обновляем SL/TP на бирже для остатка (30%)
                 try {
+                  const validTp3 = pos.tp3 && (
+                    (pos.side === 'long'  && pos.tp3 > currentPrice) ||
+                    (pos.side === 'short' && pos.tp3 < currentPrice)
+                  );
                   await this.exchange.setTradingStop(pair, {
                     stopLoss:   pos.stopLoss,
-                    takeProfit: pos.tp3,
+                    ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
                     tpSize:     pos.size,  // остаток после TP1+TP2 (30%)
                     side:       pos.side,
                   });
@@ -1631,19 +1868,253 @@ class TradingBot {
    * а не всю позицию целиком. Это страховка на случай, если TP1/TP2 боту не удалось
    * закрыть вовремя (gap, проскальзывание, таймаут).
    */
-  async _setPositionStopLossAndTakeProfit(pair, pos) {
-    try {
-      // На бирже ставим SL + TP3 (финальный тейк). TP1 и TP2 обрабатываются ботом.
-      const tp = pos.tp3 || pos.takeProfit;
-      await this.exchange.setTradingStop(pair, {
-        stopLoss:   pos.stopLoss,
-        takeProfit: tp,
-        tpSize:     pos.size,   // Partial: закрываем ровно текущий остаток
-        side:       pos.side,   // нужен для positionIdx в Hedge mode
-      });
-      logger.info(`${pair}: SL=${pos.stopLoss} TP3=${tp} (tpSize=${pos.size}) установлены | TP1=${pos.tp1} TP2=${pos.tp2}`);
-    } catch (err) {
-      logger.warn(`${pair}: ошибка setTradingStop: ${err.message}`);
+  /**
+   * Верификация состояния позиции через 10 сек после открытия.
+   * Проверяет: SL/TP на бирже, пройденные TP1/TP2.
+   */
+  async _verifyPositionState(pair) {
+    const pos = this.positions.get(pair);
+    if (!pos) return; // позиция уже закрыта
+
+    logger.info(`${pair}: верификация состояния позиции (10с после открытия)...`);
+
+    // Получаем актуальные данные с биржи
+    const openPositions = await this.exchange.fetchOpenPositions(pair);
+    const symbol = pair.replace('/', '');
+    const exPos = openPositions.find(p =>
+      p.symbol?.includes(symbol) || p.symbol?.includes(pair.split('/')[0])
+    );
+
+    if (!exPos || Math.abs(parseFloat(exPos.contracts || exPos.info?.size || 0)) === 0) {
+      logger.info(`${pair}: верификация — позиция не найдена на бирже (уже закрыта?)`);
+      return;
+    }
+
+    const currentPrice = parseFloat(exPos.markPrice || exPos.info?.markPrice || exPos.entryPrice || 0);
+    const slOnExchange = parseFloat(exPos.stopLossPrice || exPos.info?.stopLoss || 0);
+    const tpOnExchange = parseFloat(exPos.takeProfitPrice || exPos.info?.takeProfit || 0);
+
+    // ── 1. Проверяем SL/TP ──
+    if (slOnExchange === 0 || tpOnExchange === 0) {
+      logger.warn(`${pair}: верификация — SL=${slOnExchange} TP=${tpOnExchange} не выставлены, исправляем...`);
+      try {
+        const tp = pos.tp3 || pos.takeProfit;
+        const result = await this.exchange.setTradingStop(pair, {
+          stopLoss:   pos.stopLoss,
+          takeProfit: tp,
+          tpSize:     pos.size,
+          side:       pos.side,
+        });
+        if (result !== null) {
+          logger.info(`${pair}: верификация — SL/TP выставлены принудительно`);
+          await this.notifier.sendMessage(
+            `🔧 <b>Верификация SL/TP</b>\n${pair}\nSL: <code>${pos.stopLoss}</code> | TP3: <code>${tp}</code>\n<i>Выставлены через 10с после открытия</i>`
+          );
+        } else {
+          logger.warn(`${pair}: верификация — setTradingStop вернул null`);
+        }
+      } catch (err) {
+        logger.error(`${pair}: верификация — ошибка setTradingStop: ${err.message}`);
+      }
+    } else {
+      logger.info(`${pair}: верификация — SL=${slOnExchange} TP=${tpOnExchange} в порядке`);
+    }
+
+    if (!currentPrice) return; // нет цены — не проверяем TP
+
+    // ── 2. Проверяем TP1 ──
+    if (!pos._tp1Hit && pos.tp1) {
+      const tp1Passed = pos.side === 'long'
+        ? currentPrice >= pos.tp1
+        : currentPrice <= pos.tp1;
+
+      if (tp1Passed) {
+        logger.warn(`${pair}: верификация — цена ${currentPrice} уже прошла TP1=${pos.tp1}, запускаем TP1 логику...`);
+        const closeSize = parseFloat((pos._originalSize * 0.3).toFixed(6));
+        if (closeSize > 0) {
+          try {
+            const closeOrder = await this.exchange.closePartial(pair, pos.side, closeSize, 'TP1-verify (1R, 30%)', pos.size);
+            const closePrice = closeOrder.average || currentPrice;
+            const partialPnl = pos.side === 'long'
+              ? (closePrice - pos.entry) * closeSize
+              : (pos.entry - closePrice) * closeSize;
+
+            pos._tp1Hit = true;
+            pos.size = parseFloat((pos.size - closeSize).toFixed(6));
+            pos._partialPnl += partialPnl;
+            pos._partialCloses.push({
+              tp: 'TP1', size: closeSize, price: closePrice,
+              pnl: parseFloat(partialPnl.toFixed(2)), time: new Date().toISOString(),
+            });
+
+            // SL → безубыток
+            const breakevenSL = pos.entry;
+            const validTp3 = pos.tp3 && (
+              (pos.side === 'long'  && pos.tp3 > currentPrice) ||
+              (pos.side === 'short' && pos.tp3 < currentPrice)
+            );
+            try {
+              await this.exchange.setTradingStop(pair, {
+                stopLoss:   breakevenSL,
+                ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
+                tpSize:     pos.size,
+                side:       pos.side,
+              });
+              pos.stopLoss = breakevenSL;
+              pos._breakevenMoved = true;
+            } catch (slErr) {
+              logger.warn(`${pair}: верификация TP1 — SL в безубыток не удался: ${slErr.message}`);
+            }
+
+            const sideIcon = pos.side === 'long' ? '🟢' : '🔴';
+            const sideRu = pos.side === 'long' ? 'ЛОНГ' : 'ШОРТ';
+            await this.notifier.sendMessage(
+              `🎯 <b>TP1 (верификация)</b>\n${sideIcon} <b>${sideRu}</b> ${pair}\n` +
+              `Закрыто: <code>30% (${closeSize})</code> по <code>${closePrice}</code>\n` +
+              `PnL: <code>${partialPnl.toFixed(2)} USDT</code>\n` +
+              `🔒 SL → безубыток: <code>${pos.entry}</code>`
+            );
+          } catch (err) {
+            logger.error(`${pair}: верификация TP1 — ошибка: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    // ── 3. Проверяем TP2 ──
+    if (pos._tp1Hit && !pos._tp2Hit && pos.tp2) {
+      const tp2Passed = pos.side === 'long'
+        ? currentPrice >= pos.tp2
+        : currentPrice <= pos.tp2;
+
+      if (tp2Passed) {
+        logger.warn(`${pair}: верификация — цена ${currentPrice} уже прошла TP2=${pos.tp2}, запускаем TP2 логику...`);
+        const closeSize = parseFloat((pos._originalSize * 0.4).toFixed(6));
+        const actualClose = Math.min(closeSize, pos.size);
+        if (actualClose > 0) {
+          try {
+            const closeOrder = await this.exchange.closePartial(pair, pos.side, actualClose, 'TP2-verify (2R, 40%)', pos.size);
+            const closePrice = closeOrder.average || currentPrice;
+            const partialPnl = pos.side === 'long'
+              ? (closePrice - pos.entry) * actualClose
+              : (pos.entry - closePrice) * actualClose;
+
+            pos._tp2Hit = true;
+            pos.size = parseFloat((pos.size - actualClose).toFixed(6));
+            pos._partialPnl += partialPnl;
+            pos._partialCloses.push({
+              tp: 'TP2', size: actualClose, price: closePrice,
+              pnl: parseFloat(partialPnl.toFixed(2)), time: new Date().toISOString(),
+            });
+
+            const validTp3 = pos.tp3 && (
+              (pos.side === 'long'  && pos.tp3 > currentPrice) ||
+              (pos.side === 'short' && pos.tp3 < currentPrice)
+            );
+            try {
+              await this.exchange.setTradingStop(pair, {
+                stopLoss:   pos.stopLoss,
+                ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
+                tpSize:     pos.size,
+                side:       pos.side,
+              });
+            } catch (e) { /* ok */ }
+
+            const sideIcon = pos.side === 'long' ? '🟢' : '🔴';
+            const sideRu = pos.side === 'long' ? 'ЛОНГ' : 'ШОРТ';
+            await this.notifier.sendMessage(
+              `🎯🎯 <b>TP2 (верификация)</b>\n${sideIcon} <b>${sideRu}</b> ${pair}\n` +
+              `Закрыто: <code>40% (${actualClose})</code> по <code>${closePrice}</code>\n` +
+              `PnL: <code>${partialPnl.toFixed(2)} USDT</code>\n` +
+              `Остаток: <code>${pos.size}</code>`
+            );
+          } catch (err) {
+            logger.error(`${pair}: верификация TP2 — ошибка: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    logger.info(`${pair}: верификация завершена`);
+  }
+
+    async _setPositionStopLossAndTakeProfit(pair, pos) {
+    const tp = pos.tp3 || pos.takeProfit;
+    const WS_TIMEOUT_MS = 5000; // ждём WS событие 5 сек, потом REST fallback
+    const MAX_ATTEMPTS = 6;
+    const DELAYS_MS = [500, 1000, 2000, 4000, 8000];
+
+    // ── Шаг 1: ждём WS подтверждения позиции (быстрый путь) ──
+    const wsTriggered = await new Promise((resolve) => {
+      // Регистрируем ожидание WS события
+      this._pendingSLSetup.set(pair, { pos, resolve });
+
+      // Fallback: если WS не ответил за WS_TIMEOUT_MS — используем REST
+      setTimeout(() => {
+        if (this._pendingSLSetup.has(pair)) {
+          this._pendingSLSetup.delete(pair);
+          logger.warn(`${pair}: WS не ответил за ${WS_TIMEOUT_MS}мс — переключаемся на REST polling`);
+          resolve('timeout');
+        }
+      }, WS_TIMEOUT_MS);
+    });
+
+    logger.info(`${pair}: триггер SL = ${wsTriggered}, выставляем SL/TP...`);
+
+    // ── Шаг 2: выставляем SL/TP (с retry если REST fallback) ──
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        // При REST fallback начиная со 2-й попытки — проверяем наличие позиции
+        if (wsTriggered === 'timeout' && attempt > 1) {
+          const positions = await this.exchange.fetchOpenPositions(pair);
+          const symbol = pair.replace('/', '');
+          const openPos = positions.find(p =>
+            p.symbol?.includes(symbol) || p.symbol?.includes(pair.split('/')[0])
+          );
+          const posSize = parseFloat(openPos?.contracts || openPos?.info?.size || '0');
+          if (!openPos || posSize === 0) {
+            const delay = DELAYS_MS[attempt - 2] || DELAYS_MS[DELAYS_MS.length - 1];
+            logger.warn(`${pair}: позиция ещё не появилась на бирже, попытка ${attempt}/${MAX_ATTEMPTS}, ждём ${delay}мс...`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          logger.info(`${pair}: позиция подтверждена (${posSize} контр.), выставляем SL/TP (попытка ${attempt})...`);
+        }
+
+        // Выставляем SL/TP
+        const result = await this.exchange.setTradingStop(pair, {
+          stopLoss:   pos.stopLoss,
+          takeProfit: tp,
+          tpSize:     pos.size,
+          side:       pos.side,
+        });
+
+        if (result === null) {
+          const delay = DELAYS_MS[attempt - 1] || DELAYS_MS[DELAYS_MS.length - 1];
+          if (attempt < MAX_ATTEMPTS) {
+            logger.warn(`${pair}: setTradingStop вернул null (zero position), попытка ${attempt}/${MAX_ATTEMPTS}, повтор через ${delay}мс...`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          const msg = `${pair}: НЕ УДАЛОСЬ выставить SL/TP после ${MAX_ATTEMPTS} попыток. Позиция открыта БЕЗ стоп-лосса!`;
+          logger.error(msg);
+          await this.notifier.sendMessage(`⚠️ <b>КРИТИЧНО: SL не установлен!</b>\n${pair}\nSL: <code>${pos.stopLoss}</code> TP: <code>${tp}</code>\nВыставьте стоп-лосс вручную!`);
+          return;
+        }
+
+        logger.info(`${pair}: SL=${pos.stopLoss} TP3=${tp} (tpSize=${pos.size}) установлены [триггер=${wsTriggered}] | TP1=${pos.tp1} TP2=${pos.tp2}`);
+        return;
+
+      } catch (err) {
+        const delay = DELAYS_MS[attempt - 1] || DELAYS_MS[DELAYS_MS.length - 1];
+        if (attempt < MAX_ATTEMPTS) {
+          logger.warn(`${pair}: ошибка setTradingStop (попытка ${attempt}/${MAX_ATTEMPTS}): ${err.message}, повтор через ${delay}мс...`);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          logger.error(`${pair}: ошибка setTradingStop после ${MAX_ATTEMPTS} попыток: ${err.message}`);
+          await this.notifier.sendMessage(`⚠️ <b>КРИТИЧНО: SL не установлен!</b>\n${pair}\nОшибка: ${err.message}\nВыставьте стоп-лосс вручную!`);
+        }
+      }
     }
   }
 
@@ -1674,6 +2145,24 @@ class TradingBot {
    * Limit PostOnly ордер, 1-2 тика от зоны.
    */
   async _checkEntry(pair, entrySignal, dailyLevels, balance, attemptKey) {
+    // ── Дневной лимит убытка ──
+    if (DAILY_LOSS_LIMIT_PCT > 0 && this._dayStats.balanceStart > 0) {
+      const dailyPnlPct = (balance.total - this._dayStats.balanceStart) / this._dayStats.balanceStart * 100;
+      if (dailyPnlPct <= -DAILY_LOSS_LIMIT_PCT) {
+        if (!this._dailyLossNotified) {
+          this._dailyLossNotified = true;
+          logger.warn(`Дневной лимит убытка: ${dailyPnlPct.toFixed(2)}% (лимит -${DAILY_LOSS_LIMIT_PCT}%). Торговля остановлена.`);
+          await this.notifier.sendMessage(
+            `🛑 <b>Дневной лимит убытка достигнут</b>\n` +
+            `P&L сегодня: <code>${dailyPnlPct.toFixed(2)}%</code>\n` +
+            `Лимит: <code>-${DAILY_LOSS_LIMIT_PCT}%</code>\n` +
+            `Новые позиции заблокированы до следующего дня.`
+          );
+        }
+        return;
+      }
+    }
+
     // ── AI фильтр ──
     if (AI_FILTER_ENABLED && this.aiFilter.enabled) {
       try {
@@ -1811,7 +2300,13 @@ class TradingBot {
       };
 
       // Limit ордер — ждём исполнения
-      if (result.status === 'open' || result.type === 'limit') {
+      // Защита от undefined: если ордер размещён (есть id) — всегда ждём исполнения
+      // Без этого при status=undefined код ошибочно трактует ордер как мгновенно исполненный
+      if (result.status === 'canceled') {
+        logger.warn(`${pair}: ордер отклонён биржей сразу (PostOnly rejected?) — отмена входа`);
+        return;
+      }
+      if (result.status === 'open' || result.status === 'new' || result.type === 'limit' || result.id) {
         this.trackOrderPlaced();
         this._pendingOrders.set(result.id, {
           pair,
@@ -1863,9 +2358,26 @@ class TradingBot {
       await this.webhook.pushToN8n('trade_opened', position);
       logger.info(`${pair}: ${entrySignal.signal} вход — ${entrySignal.reason}`);
     } catch (err) {
-      logger.error(`Ошибка размещения ордера ${pair}: ${err.message}`);
-      await this.notifier.notifyError(err);
-      await this.webhook.pushToN8n('order_error', { pair, error: err.message });
+      const isMarginError = /ab not enough|insufficient.*balance|insufficient.*margin|not enough.*balance|not enough.*margin/i.test(err.message);
+      if (isMarginError) {
+        this._dayStats.marginFailures = (this._dayStats.marginFailures || 0) + 1;
+        this._saveDayStats();
+        logger.warn(`${pair}: ордер не открыт — недостаточно маржи (всего сегодня: ${this._dayStats.marginFailures})`);
+        await this.notifier.sendMessage(
+          `💰 <b>Недостаточно маржи</b>
+` +
+          `${pair} — ордер не размещён
+` +
+          `<i>${err.message}</i>
+
+` +
+          `Сегодня пропущено по марже: <b>${this._dayStats.marginFailures}</b>`
+        );
+      } else {
+        logger.error(`Ошибка размещения ордера ${pair}: ${err.message}`);
+        await this.notifier.notifyError(err);
+        await this.webhook.pushToN8n('order_error', { pair, error: err.message });
+      }
     }
   }
 }
