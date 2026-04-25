@@ -27,7 +27,7 @@ class AIFilter {
 
     const topLevels = levels.slice(0, 5).map((l) => ({ price: l.price.toFixed(2), type: l.type, touches: l.touches }));
 
-    const prompt = `Ты криптотрейдинг-аналитик. Оцени сигнал и ответь ТОЛЬКО валидным JSON: {"approved": true/false, "confidence": 0-100, "reason": "краткое объяснение на русском языке"}
+    const prompt = `Ты криптотрейдинг-аналитик. Оцени торговый сигнал.
 
 Сигнал: ${signal.signal.toUpperCase()} ${signal.type} на ${signal.pair || 'unknown'}
 Вход: ${signal.entry}, SL: ${signal.stopLoss}, TP: ${signal.takeProfit}
@@ -40,7 +40,8 @@ ${JSON.stringify(last10)}
 Ключевые уровни:
 ${JSON.stringify(topLevels)}
 
-ВАЖНО: поле "reason" должно быть на русском языке.`;
+Ответь СТРОГО одной строкой валидного JSON без каких-либо пояснений, markdown, текста до или после:
+{"approved": true/false, "confidence": 0-100, "reason": "краткое объяснение на русском языке"}`;
 
     try {
       const response = await this._request(prompt);

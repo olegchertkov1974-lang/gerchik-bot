@@ -92,6 +92,12 @@ class TradingBot {
     this._last5mScan = 0;           // 5m поиск входа
     this._lastBreakevenCheck = 0;   // безубыток (1m)
     this._4hTrendCache = new Map(); // pair -> { trend, confirmation, approach, candles, updatedAt }
+    this._marketRegime = null;
+    this._marketRegimeUpdatedAt = 0;
+    this._consecutiveLosses = 0;
+    this._botState = 'ACTIVE'; // ACTIVE | RECOVERY | BUILD_UP | PAUSE
+    this._recoveryWins = 0;
+    this._buildUpWins = 0;
 
     // Дневная статистика по ордерам (сбрасывается в отчёте)
     this._dayStats = this._loadDayStats();
@@ -198,6 +204,34 @@ class TradingBot {
   /**
    * Миллисекунды до начала следующей минуты (+ 2с буфер на закрытие свечи).
    */
+  _updateBotState() {
+    if (this._consecutiveLosses >= 5 && this._botState !== 'PAUSE') {
+      this._botState = 'PAUSE';
+      this._recoveryWins = 0;
+      this._buildUpWins = 0;
+      logger.info('Режим ПАУЗА: 5 стопов подряд');
+      this.notifier.sendMessage('⛔ Пауза: 5 стопов подряд. Вход остановлен.').catch(() => {});
+    } else if (this._consecutiveLosses >= 3 && this._botState === 'ACTIVE') {
+      this._botState = 'RECOVERY';
+      this._recoveryWins = 0;
+      logger.info('Режим RECOVERY: 3+ стопа, риск 50%');
+      this.notifier.sendMessage('⚠️ Режим восстановления: риск снижен до 50%.').catch(() => {});
+    }
+    if (this._botState === 'RECOVERY' && this._recoveryWins >= 2) {
+      this._botState = 'BUILD_UP';
+      this._buildUpWins = 0;
+      logger.info('Режим BUILD-UP: 2 победы в RECOVERY — риск 75%');
+      this.notifier.sendMessage('📈 Режим BUILD-UP: рынок возвращается. Риск 75%.').catch(() => {});
+    }
+    if (this._botState === 'BUILD_UP' && this._buildUpWins >= 2) {
+      this._botState = 'ACTIVE';
+      this._buildUpWins = 0;
+      this._consecutiveLosses = 0;
+      logger.info('Режим АКТИВЕН: подтверждено — полный риск 100%');
+      this.notifier.sendMessage('🟢 Бот полностью активен. Риск 100%.').catch(() => {});
+    }
+  }
+
   _msUntilNextMinute() {
     const now = Date.now();
     const nextMin = Math.ceil(now / 60000) * 60000 + 2000; // +2с буфер
@@ -287,6 +321,15 @@ class TradingBot {
         this._orderAttempts.set(pending.attemptKey, attempts);
       }
       logger.info(`WS: ордер ${orderId} отменён биржей (PostOnly?)`);
+      const _sideRu = pending.signal && pending.signal.signal === 'long' ? 'ЛОНГ' : 'ШОРТ';
+      const _emoji = pending.signal && pending.signal.signal === 'long' ? '🟢' : '🔴';
+      this.notifier.sendMessage(
+        `❌ <b>Ордер отменён биржей (PostOnly)</b>
+` +
+        `${_emoji} ${_sideRu} ${pending.pair}
+` +
+        `Цена ушла от уровня — ордер не выставлен`
+      ).catch(() => {});
     }
   }
 
@@ -842,6 +885,16 @@ class TradingBot {
         // === ЛОГИРОВАНИЕ (Раздел 10 Герчика) ===
         const sideRu = pos.side === 'long' ? 'ЛОНГ' : 'ШОРТ';
         const closeIcon = closeType === 'tp' ? '✅' : closeType === 'breakeven' ? '🔒' : closeType === 'sl' ? '🛑' : '⬜';
+        if (closeType === 'sl') {
+          this._consecutiveLosses++;
+        } else if (closeType === 'tp') {
+          this._consecutiveLosses = 0;
+          if (this._botState === 'RECOVERY') this._recoveryWins++;
+          else if (this._botState === 'BUILD_UP') this._buildUpWins++;
+        } else if (closeType === 'breakeven') {
+          this._consecutiveLosses = 0;
+        }
+        this._updateBotState();
 
         // Информация о частичных закрытиях
         const partials = pos._partialCloses || [];
@@ -1307,12 +1360,38 @@ class TradingBot {
       logger.info(`[${utcTime}] ─── Сканирование 5m входов (закрытие 5m свечи) ───`);
       this._last5mScan = now;
 
-      for (const pair of PAIRS) {
+      // ── Режим рынка BTC (каждые 4 часа) ──
+      if (now - this._marketRegimeUpdatedAt > 4 * 60 * 60 * 1000) {
         try {
-          await this._processPairGerchik(pair, balance);
-        } catch (err) {
-          logger.error(`Ошибка ${pair}: ${err.message}`);
+          const btc1d = await this.exchange.fetchCandles('BTC/USDT', '1d', 25);
+          this._marketRegime = GerchikLevels.detectMarketRegime(btc1d);
+          this._marketRegimeUpdatedAt = now;
+          const r = this._marketRegime;
+          logger.info(`Режим рынка BTC: ${r.regime} | ATR: ${r.atrPct}% | Изменение 24ч: ${r.change24h}%`);
+          try {
+            const fs = require('fs');
+            fs.writeFileSync('/opt/trading-bot/trading-bot/data/market-regime.json', JSON.stringify({
+              ...this._marketRegime,
+              updatedAt: new Date().toISOString(),
+              consecutiveLosses: this._consecutiveLosses,
+              botState: this._botState,
+              recoveryWins: this._recoveryWins,
+              buildUpWins: this._buildUpWins
+            }));
+          } catch (_) {}
+        } catch (e) {
+          logger.warn(`Не удалось обновить режим рынка: ${e.message}`);
         }
+      }
+
+      const CONCURRENCY = 10;
+      for (let i = 0; i < PAIRS.length; i += CONCURRENCY) {
+        const batch = PAIRS.slice(i, i + CONCURRENCY);
+        await Promise.all(batch.map(pair =>
+          this._processPairGerchik(pair, balance).catch(err =>
+            logger.error(`Ошибка ${pair}: ${err.message}`)
+          )
+        ));
       }
 
       await this.webhook.pushToN8n('tick_complete', {
@@ -1613,6 +1692,12 @@ class TradingBot {
         continue;
       }
 
+      // Фильтр: глубокие ложные пробои на уровне (хвосты >30% ATR за 20 свечей 1D)
+      if (level.hasDeepFalseBreakouts) {
+        logger.debug(`${pair}: уровень ${level.price.toFixed(2)} — глубокие ложные пробои — пропуск`);
+        continue;
+      }
+
       // Определяем направление: цена выше уровня — лонг (отскок от поддержки),
       // цена ниже — шорт (отскок от сопротивления)
       let direction = null;
@@ -1627,48 +1712,69 @@ class TradingBot {
 
       if (!direction) continue;
 
-      // 8. Фильтр тренда по методологии Герчика (1D + 4H)
-      // Правила:
-      //   - Зеркальный уровень (mirror)  → можно против тренда, уменьшить объём
-      //   - Очень сильный уровень (>= 8) → можно против тренда, уменьшить объём
-      //   - Всё остальное против тренда  → пропуск
-      //   - Neutral тренд                → торгуем в обе стороны
-      const trend1D = this.strategy.detectTrend4H(dailyData.candles);
+      // 8. Проверка тренда на 4H
       const trend4H = this.strategy.detectTrend4H(candles4H);
-
-      const trend1DConflict = (direction === 'long' && trend1D === 'down') || (direction === 'short' && trend1D === 'up');
-      const trend4HConflict = (direction === 'long' && trend4H === 'down') || (direction === 'short' && trend4H === 'up');
-      const isCounterTrend = trend1DConflict || trend4HConflict;
-
-      // Против тренда разрешено только на зеркальных или очень сильных уровнях
-      const counterTrendAllowed = level.isMirror || level.strength >= 8;
-
-      if (trend1DConflict && !counterTrendAllowed) {
-        logger.info(`${pair}: 1D тренд [${trend1D}] против ${direction} | ${level.classification} сила:${level.strength} — пропуск`);
+      const confirmation = this.strategy.check4HConfirmation(candles4H, direction);
+      if (!confirmation.confirmed && level.strength < 6) {
+        logger.info(`${pair}: 4H тренд [${trend4H}] противоречит ${direction} при слабом уровне ${level.price.toFixed(2)} (сила ${level.strength}) — пропуск`);
         continue;
-      }
-      if (trend4HConflict && !counterTrendAllowed) {
-        logger.info(`${pair}: 4H тренд [${trend4H}] против ${direction} | ${level.classification} сила:${level.strength} — пропуск`);
-        continue;
-      }
-
-      // Против тренда на сильном/зеркальном уровне — уменьшить объём
-      const confirmation = { confirmed: true, reduce: isCounterTrend && counterTrendAllowed };
-      if (isCounterTrend) {
-        logger.info(`${pair}: ПРОТИВ ТРЕНДА (1D:${trend1D} 4H:${trend4H}) но уровень ${level.classification} сила:${level.strength} — объём уменьшен`);
       }
 
       // 9. Анализ поведения на 4H при подходе к уровню
       const approach = this.strategy.analyze4HApproach(candles4H, level);
-      logger.info(`${pair}: уровень ${level.price.toFixed(2)} в зоне! 1D тренд: ${trend1D}, 4H тренд: ${trend4H}, подход: ${approach.approach}, направление: ${direction}`);
+      logger.info(`${pair}: уровень ${level.price.toFixed(2)} в зоне! 4H тренд: ${trend4H}, подход: ${approach.approach}, направление: ${direction}`);
 
-      // 10. Поиск паттерна входа на 5m
+      // 10. Проверка энергии на 5m (база или подход на малых барах)
+      if (!this.strategy.hasEnergy5m(candles5m, level, direction)) {
+        logger.info(`${pair}: нет энергии на 5m у уровня ${level.price.toFixed(2)} (${direction}) — пропуск`);
+        continue;
+      }
+
+      // 11. Поиск паттерна входа на 5m
       const signal = this.strategy.findEntryPattern(candles5m, level, direction, dailyLevels);
 
       if (!signal) {
         logger.info(`${pair}: нет паттерна на 5m у уровня ${level.price.toFixed(2)} (${direction}) — ожидание`);
         continue;
       }
+
+      // ── Фильтр по режиму рынка BTC ──
+      const _regime = this._marketRegime?.regime || 'sideways';
+      if (_regime === 'sideways' && signal.type !== 'false_breakout') {
+        logger.info(`${pair}: боковик — только ложный пробой (сигнал: ${signal.type}) — пропуск`);
+        continue;
+      }
+      if (_regime === 'trend_up' && direction === 'short' && signal.type !== 'false_breakout') {
+        logger.info(`${pair}: тренд вверх — шорты пропущены (не ложный пробой)`);
+        continue;
+      }
+      if (_regime === 'trend_down' && direction === 'long' && signal.type !== 'false_breakout') {
+        logger.info(`${pair}: тренд вниз — лонги пропущены (не ложный пробой)`);
+        continue;
+      }
+
+      // 11.5 Проверка объёма с учётом типа паттерна
+      if (signal.type === 'breakout') {
+        if (!this.strategy.hasBreakoutVolume(candles5m, 1.5)) {
+          logger.info(`${pair}: слабый объём на пробое (${signal.type}) у уровня ${level.price.toFixed(2)} — пропуск`);
+          continue;
+        }
+      } else if (signal.type === 'false_breakout') {
+        // ложный пробой по Герчику не требует повышенного объёма — пропускаем проверку
+      } else {
+        if (!this.strategy.hasBreakoutVolume(candles5m, 1.0)) {
+          logger.info(`${pair}: объём ниже среднего (${signal.type}) у уровня ${level.price.toFixed(2)} — пропуск`);
+          continue;
+        }
+      }
+
+      // ── Динамический риск по серии стопов ──
+      if (this._botState === 'PAUSE') {
+        logger.info(`${pair}: пауза — ${this._consecutiveLosses} стопов подряд, вход пропущен`);
+        continue;
+      }
+      if (this._botState === 'RECOVERY') signal._riskMultiplier = 0.5;
+      if (this._botState === 'BUILD_UP') signal._riskMultiplier = 0.75;
 
       // Проверка макс попыток на этот сетап
       const attemptKey = `${pair}:${level.price.toFixed(2)}:${direction}`;
@@ -1700,9 +1806,9 @@ class TradingBot {
 
   /**
    * Мониторинг трёх уровней тейк-профита:
-   *   TP1 (1R) — закрываем 30%, SL → безубыток
+   *   TP1 (1R) — закрываем 40%, SL → безубыток
    *   TP2 (2R) — закрываем 40%
-   *   TP3 (3R) — закрываем оставшиеся 30% (или SL на бирже)
+   *   TP3 (3R) — закрываем оставшиеся 20% (или SL на бирже)
    */
   async _checkTakeProfitLevels() {
     for (const [pair, pos] of this.positions) {
@@ -1722,17 +1828,17 @@ class TradingBot {
         const sideRu = pos.side === 'long' ? 'ЛОНГ' : 'ШОРТ';
         const sideIcon = pos.side === 'long' ? '🟢' : '🔴';
 
-        // ── TP1: 1R — закрываем 30%, SL → безубыток ──
+        // ── TP1: 1R — закрываем 40%, SL → безубыток ──
         if (!pos._tp1Hit && pos.tp1) {
           const tp1Hit = pos.side === 'long'
             ? currentPrice >= pos.tp1
             : currentPrice <= pos.tp1;
 
           if (tp1Hit) {
-            const closeSize = parseFloat((pos._originalSize * 0.3).toFixed(6));
+            const closeSize = parseFloat((pos._originalSize * 0.4).toFixed(6));
             if (closeSize > 0) {
               try {
-                const closeOrder = await this.exchange.closePartial(pair, pos.side, closeSize, 'TP1 (1R, 30%)', pos.size);
+                const closeOrder = await this.exchange.closePartial(pair, pos.side, closeSize, 'TP1 (1R, 40%)', pos.size);
                 const closePrice = closeOrder.average || currentPrice;
                 const partialPnl = pos.side === 'long'
                   ? (closePrice - pos.entry) * closeSize
@@ -1758,7 +1864,7 @@ class TradingBot {
                   await this.exchange.setTradingStop(pair, {
                     stopLoss:   breakevenSL,
                     ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
-                    tpSize:     pos.size,  // остаток после закрытия TP1 (70%)
+                    tpSize:     pos.size,  // остаток после закрытия TP1 (60%)
                     side:       pos.side,
                   });
                   pos.stopLoss = breakevenSL;
@@ -1768,7 +1874,7 @@ class TradingBot {
                 }
 
                 logger.info(
-                  `TP1 HIT ${pair} ${sideRu}: закрыто 30% (${closeSize}) по ${closePrice} | ` +
+                  `TP1 HIT ${pair} ${sideRu}: закрыто 40% (${closeSize}) по ${closePrice} | ` +
                   `PnL=${partialPnl.toFixed(2)} | SL ${oldSL}→${pos.entry} | остаток=${pos.size}`
                 );
 
@@ -1776,7 +1882,7 @@ class TradingBot {
                   `🎯 <b>TP1 достигнут (1R)</b>\n` +
                   `${sideIcon} <b>${sideRu}</b> ${pair}\n` +
                   `━━━━━━━━━━━━━━━━━━\n` +
-                  `Закрыто: <code>30% (${closeSize})</code> по <code>${closePrice}</code>\n` +
+                  `Закрыто: <code>40% (${closeSize})</code> по <code>${closePrice}</code>\n` +
                   `PnL: <code>${partialPnl.toFixed(2)} USDT</code>\n` +
                   `🔒 SL → безубыток: <code>${pos.entry}</code>\n` +
                   `Остаток: <code>${pos.size}</code>\n` +
@@ -1814,24 +1920,27 @@ class TradingBot {
                   pnl: parseFloat(partialPnl.toFixed(2)), time: new Date().toISOString(),
                 });
 
-                // Обновляем SL/TP на бирже для остатка (30%)
+                // Трейлинг 1.5% на остаток 20%: пробуем native Bybit API
+                const trailDist = parseFloat((currentPrice * 0.015).toFixed(8));
                 try {
-                  const validTp3 = pos.tp3 && (
-                    (pos.side === 'long'  && pos.tp3 > currentPrice) ||
-                    (pos.side === 'short' && pos.tp3 < currentPrice)
-                  );
                   await this.exchange.setTradingStop(pair, {
-                    stopLoss:   pos.stopLoss,
-                    ...(validTp3 ? { takeProfit: pos.tp3 } : {}),
-                    tpSize:     pos.size,  // остаток после TP1+TP2 (30%)
-                    side:       pos.side,
+                    stopLoss:     pos.stopLoss,
+                    trailingStop: trailDist,
+                    activePrice:  currentPrice,
+                    side:         pos.side,
                   });
-                } catch (e) { /* ok */ }
+                  pos._nativeTrailing = true;
+                } catch (e) {
+                  logger.warn(`${pair}: native trailing не удался (${e.message}), активируем программный`);
+                }
+                pos._trailingActive  = true;
+                pos._trailingExtreme = currentPrice;
 
                 logger.info(
                   `TP2 HIT ${pair} ${sideRu}: закрыто 40% (${actualClose}) по ${closePrice} | ` +
                   `PnL=${partialPnl.toFixed(2)} | остаток=${pos.size}`
                 );
+                logger.info(`TP2 достигнут — трейлинг 1.5% активирован на 20% позиции ${pair}`);
 
                 await this.notifier.sendMessage(
                   `🎯🎯 <b>TP2 достигнут (2R)</b>\n` +
@@ -1840,11 +1949,50 @@ class TradingBot {
                   `Закрыто: <code>40% (${actualClose})</code> по <code>${closePrice}</code>\n` +
                   `PnL: <code>${partialPnl.toFixed(2)} USDT</code>\n` +
                   `Остаток: <code>${pos.size}</code>\n` +
-                  `Следующий: TP3 (3R) = <code>${pos.tp3}</code>`
+                  `🔔 Трейлинг 1.5% активирован на 20%`
                 );
               } catch (err) {
                 logger.error(`${pair}: TP2 частичное закрытие ошибка: ${err.message}`);
               }
+            }
+          }
+        }
+
+        // ── Trailing stop (программный fallback после TP2) ──
+        if (pos._tp2Hit && !pos._tp3Hit && pos._trailingActive && !pos._nativeTrailing) {
+          if (pos.side === 'long') {
+            if (currentPrice > pos._trailingExtreme) pos._trailingExtreme = currentPrice;
+            if (currentPrice <= pos._trailingExtreme * (1 - 0.015)) {
+              try {
+                await this.exchange.closePartial(pair, pos.side, pos.size, 'trailing 1.5%', pos.size);
+                pos._tp3Hit = true;
+                pos._trailingActive = false;
+                const rollback = ((pos._trailingExtreme - currentPrice) / pos._trailingExtreme * 100).toFixed(2);
+                logger.info(`Trailing triggered ${pair}: закрыт остаток ${pos.size} по ${currentPrice}`);
+                await this.notifier.sendMessage(
+                  `🔔 <b>Трейлинг сработал</b>\n` +
+                  `${sideIcon} <b>${sideRu}</b> ${pair}\n` +
+                  `Закрыт остаток: <code>${pos.size}</code> по <code>${currentPrice}</code>\n` +
+                  `Откат от максимума: ${rollback}%`
+                );
+              } catch (err) { logger.error(`${pair}: trailing close: ${err.message}`); }
+            }
+          } else {
+            if (currentPrice < pos._trailingExtreme) pos._trailingExtreme = currentPrice;
+            if (currentPrice >= pos._trailingExtreme * (1 + 0.015)) {
+              try {
+                await this.exchange.closePartial(pair, pos.side, pos.size, 'trailing 1.5%', pos.size);
+                pos._tp3Hit = true;
+                pos._trailingActive = false;
+                const growth = ((currentPrice - pos._trailingExtreme) / pos._trailingExtreme * 100).toFixed(2);
+                logger.info(`Trailing triggered ${pair}: закрыт остаток ${pos.size} по ${currentPrice}`);
+                await this.notifier.sendMessage(
+                  `🔔 <b>Трейлинг сработал</b>\n` +
+                  `${sideIcon} <b>${sideRu}</b> ${pair}\n` +
+                  `Закрыт остаток: <code>${pos.size}</code> по <code>${currentPrice}</code>\n` +
+                  `Рост от минимума: ${growth}%`
+                );
+              } catch (err) { logger.error(`${pair}: trailing close: ${err.message}`); }
             }
           }
         }
@@ -1930,10 +2078,10 @@ class TradingBot {
 
       if (tp1Passed) {
         logger.warn(`${pair}: верификация — цена ${currentPrice} уже прошла TP1=${pos.tp1}, запускаем TP1 логику...`);
-        const closeSize = parseFloat((pos._originalSize * 0.3).toFixed(6));
+        const closeSize = parseFloat((pos._originalSize * 0.4).toFixed(6));
         if (closeSize > 0) {
           try {
-            const closeOrder = await this.exchange.closePartial(pair, pos.side, closeSize, 'TP1-verify (1R, 30%)', pos.size);
+            const closeOrder = await this.exchange.closePartial(pair, pos.side, closeSize, 'TP1-verify (1R, 40%)', pos.size);
             const closePrice = closeOrder.average || currentPrice;
             const partialPnl = pos.side === 'long'
               ? (closePrice - pos.entry) * closeSize
@@ -1970,7 +2118,7 @@ class TradingBot {
             const sideRu = pos.side === 'long' ? 'ЛОНГ' : 'ШОРТ';
             await this.notifier.sendMessage(
               `🎯 <b>TP1 (верификация)</b>\n${sideIcon} <b>${sideRu}</b> ${pair}\n` +
-              `Закрыто: <code>30% (${closeSize})</code> по <code>${closePrice}</code>\n` +
+              `Закрыто: <code>40% (${closeSize})</code> по <code>${closePrice}</code>\n` +
               `PnL: <code>${partialPnl.toFixed(2)} USDT</code>\n` +
               `🔒 SL → безубыток: <code>${pos.entry}</code>`
             );
@@ -2217,6 +2365,13 @@ class TradingBot {
       logger.info(`${pair}: размер уменьшен вдвое (противоречие 4H) → ${sizing.size}`);
     }
 
+    if (entrySignal._riskMultiplier && entrySignal._riskMultiplier < 1) {
+      const mult = entrySignal._riskMultiplier;
+      sizing.size = parseFloat((sizing.size * mult).toFixed(6));
+      sizing.riskAmount = parseFloat((sizing.riskAmount * mult).toFixed(2));
+      logger.info(`${pair}: риск ${mult * 100}% (режим ${this._botState}) → ${sizing.size}`);
+    }
+
     // ── Проверка SL на правильной стороне от entry ──
     if (entrySignal.signal === 'long' && entrySignal.stopLoss >= entrySignal.entry) {
       logger.warn(`${pair}: SL ${entrySignal.stopLoss} >= entry ${entrySignal.entry} для LONG — невалидный сигнал, пропуск`);
@@ -2264,8 +2419,6 @@ class TradingBot {
         pair,
         entrySignal.signal === 'long' ? 'buy' : 'sell',
         sizing.size,
-        entrySignal.stopLoss,
-        entrySignal.takeProfit,
         entrySignal.entry, // limit price
         true // postOnly
       );
@@ -2279,9 +2432,9 @@ class TradingBot {
         tp1: entrySignal.tp1 || entrySignal.takeProfit,
         tp2: entrySignal.tp2 || entrySignal.takeProfit,
         tp3: entrySignal.tp3 || entrySignal.takeProfit,
-        _tp1Hit: false,  // TP1 достигнут — закрыто 30%, SL → безубыток
+        _tp1Hit: false,  // TP1 достигнут — закрыто 40%, SL → безубыток
         _tp2Hit: false,  // TP2 достигнут — закрыто 40%
-        _tp3Hit: false,  // TP3 достигнут — закрыто 30% (или SL на бирже)
+        _tp3Hit: false,  // TP3 достигнут — закрыто 20% (или SL на бирже)
         _originalSize: sizing.size, // начальный размер позиции
         _originalSL: entrySignal.stopLoss,
         size: sizing.size,
@@ -2328,7 +2481,7 @@ class TradingBot {
           `━━━━━━━━━━━━━━━━━━\n` +
           `Цена: <code>${entrySignal.entry}</code>\n` +
           `SL: <code>${entrySignal.stopLoss}</code>\n` +
-          `TP1 (1R, 30%): <code>${entrySignal.tp1}</code> | TP2 (2R, 40%): <code>${entrySignal.tp2}</code> | TP3 (3R, 30%): <code>${entrySignal.tp3}</code>\n` +
+          `TP1 (1R, 40%): <code>${entrySignal.tp1}</code> | TP2 (2R, 40%): <code>${entrySignal.tp2}</code> | TP3 (3R, 30%): <code>${entrySignal.tp3}</code>\n` +
           `R:R: <code>1:${entrySignal.riskRewardRatio}</code>\n` +
           `Размер: <code>${sizing.size}</code> | Риск: <code>${sizing.riskAmount} USDT</code>\n\n` +
           `📐 Уровень: ${levelInfo ? `${levelInfo.price.toFixed(2)} (${this.strategy._classificationRu(levelInfo.classification)}, сила ${levelInfo.strength})` : entrySignal.level}\n` +

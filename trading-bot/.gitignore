@@ -1,0 +1,12 @@
+.env
+*.log
+data/
+backups/
+reports/
+node_modules/
+__pycache__/
+*.bak
+*.bak2
+SESSION_NOTES.md
+chart.min.js
+=

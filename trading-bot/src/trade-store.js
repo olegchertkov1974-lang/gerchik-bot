@@ -7,24 +7,12 @@
 const path = require('path');
 const logger = require('./logger');
 
-let Database;
-try {
-  Database = require('better-sqlite3');
-} catch (_) {
-  Database = null;
-}
+const Database = require('better-sqlite3');
 
 const DB_PATH = path.resolve(__dirname, '..', 'data', 'trades.db');
 
 class TradeStore {
   constructor() {
-    if (!Database) {
-      logger.warn('TradeStore: better-sqlite3 not installed, using in-memory fallback');
-      this.db = null;
-      this.trades = [];
-      return;
-    }
-
     const fs = require('fs');
     const dir = path.dirname(DB_PATH);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -99,7 +87,6 @@ class TradeStore {
   }
 
   saveTrade(trade) {
-    if (!this.db) { this.trades.push(trade); return; }
     try {
       const stmt = this.db.prepare(`
         INSERT INTO trades (pair, timeframe, side, entry, exit_price, stop_loss,
@@ -126,7 +113,6 @@ class TradeStore {
   }
 
   saveAnalysis(closedAt, analysis) {
-    if (!this.db) return;
     try {
       const stmt = this.db.prepare(`UPDATE trades SET ai_grade = ?, ai_lessons = ?, ai_improvement = ? WHERE closed_at = ?`);
       stmt.run(analysis.grade, JSON.stringify(analysis.lessons || []), analysis.improvement || '', closedAt);
@@ -134,17 +120,10 @@ class TradeStore {
   }
 
   getRecentTrades(limit = 20) {
-    if (!this.db) return this.trades.slice(-limit);
     return this.db.prepare('SELECT * FROM trades ORDER BY id DESC LIMIT ?').all(limit);
   }
 
   getStats() {
-    if (!this.db) {
-      const wins = this.trades.filter((t) => t.pnl > 0).length;
-      const losses = this.trades.filter((t) => t.pnl <= 0).length;
-      const totalPnl = this.trades.reduce((s, t) => s + (t.pnl || 0), 0);
-      return { total: this.trades.length, wins, losses, totalPnl };
-    }
     const row = this.db.prepare(`
       SELECT COUNT(*) as total,
         SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
@@ -160,16 +139,14 @@ class TradeStore {
   }
 
   getTradesToday(dateStr) {
-    if (!this.db) return this.trades.filter(t => (t.closedAt || '').startsWith(dateStr));
     return this.db.prepare(`SELECT * FROM trades WHERE closed_at >= ? AND closed_at < date(?, '+1 day') ORDER BY id`).all(dateStr, dateStr);
   }
 
   getAllTrades() {
-    if (!this.db) return [...this.trades];
     return this.db.prepare('SELECT * FROM trades ORDER BY id').all();
   }
 
-  close() { if (this.db) this.db.close(); }
+  close() { this.db.close(); }
 }
 
 module.exports = TradeStore;

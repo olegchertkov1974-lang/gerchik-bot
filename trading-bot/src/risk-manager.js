@@ -20,7 +20,6 @@ class RiskManager {
     this.riskPct = Math.min(Math.max(options.riskPct || DEFAULT_RISK_PCT, MIN_RISK_PCT), MAX_RISK_PCT);
     this.minRR = options.minRR || MIN_RR_RATIO;
     this.maxConcurrent = options.maxConcurrentPositions || MAX_CONCURRENT_POSITIONS;
-    this.openPositions = [];
   }
 
   calculatePositionSize(balance, entry, stopLoss) {
@@ -51,15 +50,8 @@ class RiskManager {
     };
   }
 
-  calculateTakeProfit(entry, stopLoss, side) {
-    const risk = Math.abs(entry - stopLoss);
-    if (side === 'long') {
-      return parseFloat((entry + risk * this.minRR).toFixed(8));
-    }
-    return parseFloat((entry - risk * this.minRR).toFixed(8));
-  }
 
-  validateOrder(order, pair) {
+  validateOrder(order, pair, positions) {
     const errors = [];
 
     if (!order.entry || order.entry <= 0) errors.push('Нет цены входа');
@@ -78,35 +70,31 @@ class RiskManager {
 
     const risk = Math.abs(order.entry - order.stopLoss);
     const reward = Math.abs((tp || 0) - order.entry);
-    if (risk > 0 && reward / risk < this.minRR) {
+    if (risk > 0 && reward / risk < this.minRR - 0.001) {
       errors.push(`R:R ${(reward / risk).toFixed(2)} ниже минимума ${this.minRR}`);
     }
 
-    if (pair) {
-      const hasPosition = this.openPositions.some((p) => p.id === pair);
-      if (hasPosition) {
-        errors.push(`Уже есть позиция по ${pair} (макс 1 на инструмент)`);
-      }
+    if (pair && positions && positions.has(pair)) {
+      errors.push(`Уже есть позиция по ${pair} (макс 1 на инструмент)`);
     }
 
-    if (this.openPositions.length >= this.maxConcurrent) {
+    if (positions && positions.size >= this.maxConcurrent) {
       errors.push(`Достигнут лимит позиций (${this.maxConcurrent})`);
     }
 
     return { valid: errors.length === 0, errors };
   }
 
+  // No-op методы. Позиции хранятся в Bot.positions (единый источник правды).
+  // Методы нужны только для совместимости с вызовами из bot.js и других файлов.
   addPosition(position) {
-    this.openPositions.push(position);
+    // namespace placeholder — реального хранилища в RiskManager нет
   }
 
-  removePosition(id) {
-    this.openPositions = this.openPositions.filter((p) => p.id !== id);
+  removePosition(posKey) {
+    // namespace placeholder — реального хранилища в RiskManager нет
   }
 
-  getOpenPositions() {
-    return [...this.openPositions];
-  }
 }
 
 module.exports = RiskManager;

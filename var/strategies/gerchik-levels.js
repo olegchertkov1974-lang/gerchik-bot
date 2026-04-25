@@ -415,6 +415,66 @@ class GerchikLevels {
       riskPct: { label: 'Risk per trade (%)', default: 1, min: 0.5, max: 3 },
     };
   }
+
+  hasEnergy5m(candles5m, level, direction) {
+    if (this._checkBasePattern(candles5m, level, direction)) return true;
+    if (candles5m.length < 20) return true;
+    const last5 = candles5m.slice(-5);
+    const last20 = candles5m.slice(-20);
+    const avg5 = last5.reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 5;
+    const avg20 = last20.reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 20;
+    if (avg20 > 0 && avg5 < avg20 * 0.7) return true;
+    let approaching = 0;
+    for (let i = 1; i < last5.length; i++) {
+      const prevDist = Math.abs(last5[i-1].close - level.price);
+      const currDist = Math.abs(last5[i].close - level.price);
+      if (currDist < prevDist) approaching++;
+    }
+    return approaching >= 2;
+  }
+
+  hasBreakoutVolume(candles5m, multiplier = 1.5) {
+    const curr = candles5m[candles5m.length - 1];
+    if (!curr || !curr.volume || curr.volume === 0) return true;
+    if (candles5m.length < 20) return true;
+    const avg20 = candles5m.slice(-20).reduce((s, c) => s + (c.volume || 0), 0) / 20;
+    if (avg20 === 0) return true;
+    return curr.volume >= avg20 * multiplier;
+  }
 }
+
+module.exports = GerchikLevels;
+
+GerchikLevels.detectMarketRegime = function(candles1d) {
+  if (!candles1d || candles1d.length < 10) return { regime: 'unknown', atrPct: 0, change24h: 0 };
+  const c = candles1d;
+  const last = c[c.length - 1];
+  const prev = c[c.length - 2];
+
+  // ATR% — средний дневной диапазон за последние 14 свечей
+  const atrCandles = c.slice(-14);
+  const atrPct = parseFloat((atrCandles.reduce((s, x) => {
+    const mid = (x.high + x.low) / 2 || x.close;
+    return s + (mid > 0 ? (x.high - x.low) / mid * 100 : 0);
+  }, 0) / atrCandles.length).toFixed(2));
+
+  // 24h change
+  const change24h = prev && prev.close > 0
+    ? parseFloat(((last.close - prev.close) / prev.close * 100).toFixed(2))
+    : 0;
+
+  // MA5 и MA20 из close
+  const closes = c.map(x => x.close);
+  const ma5  = closes.slice(-5).reduce((s, v) => s + v, 0) / 5;
+  const ma20 = closes.slice(-20).reduce((s, v) => s + v, 0) / Math.min(20, closes.length);
+  const slope = closes.slice(-5).reduce((s, v, i, a) => i === 0 ? 0 : s + (v - a[i-1]), 0) / 4;
+
+  let regime;
+  if (ma5 > ma20 * 1.01 && slope > 0) regime = 'trend_up';
+  else if (ma5 < ma20 * 0.99 && slope < 0) regime = 'trend_down';
+  else regime = 'sideways';
+
+  return { regime, atrPct, change24h, ma5: parseFloat(ma5.toFixed(2)), ma20: parseFloat(ma20.toFixed(2)), slope: parseFloat(slope.toFixed(2)) };
+};
 
 module.exports = GerchikLevels;

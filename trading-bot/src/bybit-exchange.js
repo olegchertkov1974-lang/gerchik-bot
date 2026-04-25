@@ -11,8 +11,6 @@
 const ccxt = require('ccxt');
 const logger = require('./logger');
 
-// Список пар определяется в bot.js — здесь ограничений нет
-const ALLOWED_PAIRS = [];
 const ALLOWED_TIMEFRAMES = ['5m', '15m', '1h', '4h', '1d'];
 const MAX_RETRIES = 3;
 const BASE_RETRY_DELAY = 2000; // ms
@@ -128,7 +126,7 @@ class BybitExchange {
    * @param {boolean} postOnly — PostOnly режим (по умолчанию true)
    * @returns {object} ордер с id, status, type
    */
-  async placeOrder(pair, side, amount, stopLoss, takeProfit, limitPrice, postOnly = true) {
+  async placeOrder(pair, side, amount, limitPrice, postOnly = true) {
     this.validatePair(pair);
 
     return this._retry(async () => {
@@ -139,18 +137,11 @@ class BybitExchange {
         params.timeInForce = 'PostOnly';
       }
 
-      // SL/TP НЕ прикрепляем к ордеру — ставим ТОЛЬКО через setTradingStop() после fill.
-      // Причина: attached SL активируется мгновенно при fill и конфликтует
-      // с последующим setTradingStop(), вызывая "закрытие через 1 минуту".
-      // (stopLoss и takeProfit параметры передаются, но не используются в ордере)
-
       const orderType = limitPrice ? 'limit' : 'market';
       const price = limitPrice || undefined;
 
       logger.info(
-        `Ордер ${orderType}${postOnly ? ' PostOnly' : ''} ${side}: ` +
-        `${pair} объём=${amount} цена=${limitPrice || 'market'} ` +
-        `SL=${stopLoss} (Stop Market) TP=${takeProfit} (Limit)`
+        `Ордер ${orderType}${postOnly ? ' PostOnly' : ''} ${side}: ${pair} объём=${amount} цена=${limitPrice || 'market'}`
       );
 
       const order = await this.exchange.createOrder(
@@ -233,10 +224,28 @@ class BybitExchange {
         params.tpTriggerBy = 'LastPrice';
       }
 
+      if (opts.trailingStop) {
+        params.trailingStop = String(opts.trailingStop);
+        if (opts.activePrice) params.activePrice = String(opts.activePrice);
+      }
+
+      if (opts.trailingStop) {
+        params.trailingStop = String(opts.trailingStop);
+        if (opts.activePrice) params.activePrice = String(opts.activePrice);
+      }
+
+      if (opts.trailingStop) {
+        params.trailingStop = String(opts.trailingStop);
+        if (opts.activePrice) params.activePrice = String(opts.activePrice);
+      }
+
+      if (opts.trailingStop) {
+        params.trailingStop = String(opts.trailingStop);
+        if (opts.activePrice) params.activePrice = String(opts.activePrice);
+      }
+
       logger.info(
-        `setTradingStop ${pair}: SL=${opts.stopLoss || '—'} TP=${opts.takeProfit || '—'}` +
-        ` tpSize=${opts.tpSize || '—'} tpslMode=${params.tpslMode || '—'}` +
-        ` positionIdx=${params.positionIdx}`
+        `setTradingStop ${pair}: SL=${opts.stopLoss || '—'} TP=${opts.takeProfit || '—'}  tpSize=${opts.tpSize || '—'} tpslMode=${params.tpslMode || '—'}  positionIdx=${params.positionIdx}`
       );
 
       try {
@@ -381,7 +390,7 @@ class BybitExchange {
    */
   async fetchOrder(orderId, pair) {
     return this._retry(async () => {
-      return this.exchange.fetchOrder(orderId, this._toLinear(pair));
+      return this.exchange.fetchOpenOrder(orderId, this._toLinear(pair));
     }, `fetchOrder(${pair})`);
   }
 
@@ -456,13 +465,6 @@ class BybitExchange {
     }
   }
 
-  getAllowedPairs() {
-    return [...ALLOWED_PAIRS];
-  }
-
-  getAllowedTimeframes() {
-    return [...ALLOWED_TIMEFRAMES];
-  }
 
   /**
    * Установить плечо для пары.
