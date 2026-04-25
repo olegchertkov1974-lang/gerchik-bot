@@ -10,3 +10,4 @@ __pycache__/
 SESSION_NOTES.md
 chart.min.js
 =
+*.bak*
