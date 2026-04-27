@@ -174,6 +174,35 @@ class GerchikLevels {
     return 'neutral';
   }
 
+  detectTrend1D(candles1D) {
+    if (!candles1D || candles1D.length < 30) return 'neutral';
+    const recent = candles1D.slice(-30);
+
+    // Свинг-экстремумы: окно 5 свечей с каждой стороны
+    const swingHighs = [], swingLows = [];
+    for (let i = 5; i < recent.length - 5; i++) {
+      const hi = recent[i].high;
+      const lo = recent[i].low;
+      let isSwingHigh = true, isSwingLow = true;
+      for (let k = i - 5; k <= i + 5; k++) {
+        if (k === i) continue;
+        if (recent[k].high >= hi) isSwingHigh = false;
+        if (recent[k].low <= lo) isSwingLow = false;
+      }
+      if (isSwingHigh) swingHighs.push(hi);
+      if (isSwingLow) swingLows.push(lo);
+    }
+
+    if (swingHighs.length < 2 || swingLows.length < 2) return 'neutral';
+
+    const [prevH, lastH] = swingHighs.slice(-2);
+    const [prevL, lastL] = swingLows.slice(-2);
+
+    if (lastH > prevH && lastL > prevL) return 'up';   // HH + HL
+    if (lastH < prevH && lastL < prevL) return 'down'; // LH + LL
+    return 'neutral';
+  }
+
   check4HConfirmation(candles4H, direction) {
     const trend = this.detectTrend4H(candles4H);
     if (direction === 'long') {
