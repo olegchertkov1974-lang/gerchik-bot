@@ -1651,8 +1651,6 @@ class TradingBot {
 
     const { levels: dailyLevels, candles: dailyCandles } = dailyData;
 
-    // 3.5 Определяем 1D тренд пары (макро-контекст)
-    const trend1D = this.strategy.detectTrend1D(dailyCandles);
 
     // 4. Фильтр объёма
     const ticker = await this.exchange.fetchTicker(pair);
@@ -1715,25 +1713,11 @@ class TradingBot {
 
       if (!direction) continue;
 
-      // 8. Фильтр 1D тренда (макро-контекст пары)
-      if (trend1D === 'up' && direction === 'short') {
-        if (!level.isMirror || level.strength < 8) {
-          logger.info(`${pair}: 1D тренд UP — шорт на уровне ${level.price.toFixed(2)} (${level.classification}, сила ${level.strength}) запрещён — пропуск`);
-          continue;
-        }
-      }
-      if (trend1D === 'down' && direction === 'long') {
-        if (!level.isMirror || level.strength < 8) {
-          logger.info(`${pair}: 1D тренд DOWN — лонг на уровне ${level.price.toFixed(2)} (${level.classification}, сила ${level.strength}) запрещён — пропуск`);
-          continue;
-        }
-      }
-
-      // 9. Проверка тренда на 4H
+      // 8. Проверка тренда на 4H
       const trend4H = this.strategy.detectTrend4H(candles4H);
       const confirmation = this.strategy.check4HConfirmation(candles4H, direction);
       if (!confirmation.confirmed) {
-        const counterTrendAllowed = level.isMirror ? level.strength >= 6 : level.strength >= 8;
+        const counterTrendAllowed = level.isMirror ? level.strength >= 5 : level.strength >= 6;
         if (!counterTrendAllowed) {
           logger.info(`${pair}: 4H тренд [${trend4H}] противоречит ${direction} — уровень ${level.price.toFixed(2)} (${level.classification}, сила ${level.strength}) не прошёл порог контртренда — пропуск`);
           continue;
