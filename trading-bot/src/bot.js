@@ -1715,9 +1715,12 @@ class TradingBot {
       // 8. Проверка тренда на 4H
       const trend4H = this.strategy.detectTrend4H(candles4H);
       const confirmation = this.strategy.check4HConfirmation(candles4H, direction);
-      if (!confirmation.confirmed && level.strength < 6) {
-        logger.info(`${pair}: 4H тренд [${trend4H}] противоречит ${direction} при слабом уровне ${level.price.toFixed(2)} (сила ${level.strength}) — пропуск`);
-        continue;
+      if (!confirmation.confirmed) {
+        const counterTrendAllowed = level.isMirror ? level.strength >= 6 : level.strength >= 8;
+        if (!counterTrendAllowed) {
+          logger.info(`${pair}: 4H тренд [${trend4H}] противоречит ${direction} — уровень ${level.price.toFixed(2)} (${level.classification}, сила ${level.strength}) не прошёл порог контртренда — пропуск`);
+          continue;
+        }
       }
 
       // 9. Анализ поведения на 4H при подходе к уровню
