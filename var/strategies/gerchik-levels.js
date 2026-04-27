@@ -453,6 +453,36 @@ class GerchikLevels {
     if (avg20 === 0) return true;
     return curr.volume >= avg20 * multiplier;
   }
+
+  calculateADX(candles, period = 14) {
+    if (!candles || candles.length < period * 2 + 1) return 0;
+    const c = candles;
+    const trs = [], plusDMs = [], minusDMs = [];
+    for (let i = 1; i < c.length; i++) {
+      const tr = Math.max(c[i].high - c[i].low, Math.abs(c[i].high - c[i-1].close), Math.abs(c[i].low - c[i-1].close));
+      const upMove = c[i].high - c[i-1].high;
+      const downMove = c[i-1].low - c[i].low;
+      plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+      minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+      trs.push(tr);
+    }
+    let atr = trs.slice(0, period).reduce((s, v) => s + v, 0);
+    let pDM  = plusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+    let mDM  = minusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+    const dxArr = [];
+    for (let i = period; i < trs.length; i++) {
+      atr = atr - atr / period + trs[i];
+      pDM  = pDM  - pDM  / period + plusDMs[i];
+      mDM  = mDM  - mDM  / period + minusDMs[i];
+      const diP = atr > 0 ? 100 * pDM / atr : 0;
+      const diM = atr > 0 ? 100 * mDM / atr : 0;
+      dxArr.push((diP + diM) > 0 ? 100 * Math.abs(diP - diM) / (diP + diM) : 0);
+    }
+    if (dxArr.length < period) return 0;
+    let adx = dxArr.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < dxArr.length; i++) adx = (adx * (period - 1) + dxArr[i]) / period;
+    return parseFloat(adx.toFixed(2));
+  }
 }
 
 module.exports = GerchikLevels;

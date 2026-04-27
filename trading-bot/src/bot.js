@@ -1667,6 +1667,9 @@ class TradingBot {
     }
     const candles4H = cached4H.candles;
 
+    // 5.5 Загружаем 1H свечи для ADX-фильтра
+    const candles1H = await this.exchange.fetchCandles(pair, '1h', 40);
+
     // 6. Получаем 5m свечи для поиска паттерна входа
     const candles5m = await this.exchange.fetchCandles(pair, TF_ENTRY, 50);
     if (!candles5m || candles5m.length < 10) {
@@ -1739,6 +1742,14 @@ class TradingBot {
 
       if (!signal) {
         logger.info(`${pair}: нет паттерна на 5m у уровня ${level.price.toFixed(2)} (${direction}) — ожидание`);
+        continue;
+      }
+
+      // ── ADX-фильтр: торгуем только в боковике (ADX < 25 на обоих ТФ) ──
+      const adx4H = this.strategy.calculateADX(candles4H);
+      const adx1H = candles1H && candles1H.length >= 28 ? this.strategy.calculateADX(candles1H) : 0;
+      if (adx4H >= 25 || adx1H >= 25) {
+        logger.info(`${pair}: ADX 4H: ${adx4H.toFixed(1)}, ADX 1H: ${adx1H.toFixed(1)} — тренд, ${signal.typeRu} пропущен`);
         continue;
       }
 
