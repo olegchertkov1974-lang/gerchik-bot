@@ -148,18 +148,29 @@ class GerchikLevels {
   detectTrend4H(candles4H) {
     if (!candles4H || candles4H.length < 20) return 'neutral';
     const recent = candles4H.slice(-20);
-    let higherLows = 0, lowerHighs = 0;
-    for (let i = 1; i < recent.length; i++) {
-      const prevLow = Math.min(recent[i-1].open, recent[i-1].close);
-      const currLow = Math.min(recent[i].open, recent[i].close);
-      const prevHigh = Math.max(recent[i-1].open, recent[i-1].close);
-      const currHigh = Math.max(recent[i].open, recent[i].close);
-      if (currLow > prevLow) higherLows++;
-      if (currHigh < prevHigh) lowerHighs++;
+
+    // Свинг-экстремумы: окно 3 свечи с каждой стороны
+    const swingHighs = [], swingLows = [];
+    for (let i = 3; i < recent.length - 3; i++) {
+      const hi = recent[i].high;
+      const lo = recent[i].low;
+      let isSwingHigh = true, isSwingLow = true;
+      for (let k = i - 3; k <= i + 3; k++) {
+        if (k === i) continue;
+        if (recent[k].high >= hi) isSwingHigh = false;
+        if (recent[k].low <= lo) isSwingLow = false;
+      }
+      if (isSwingHigh) swingHighs.push(hi);
+      if (isSwingLow) swingLows.push(lo);
     }
-    const total = recent.length - 1;
-    if (higherLows > total * 0.55) return 'up';
-    if (lowerHighs > total * 0.55) return 'down';
+
+    if (swingHighs.length < 2 || swingLows.length < 2) return 'neutral';
+
+    const [prevH, lastH] = swingHighs.slice(-2);
+    const [prevL, lastL] = swingLows.slice(-2);
+
+    if (lastH > prevH && lastL > prevL) return 'up';   // HH + HL
+    if (lastH < prevH && lastL < prevL) return 'down'; // LH + LL
     return 'neutral';
   }
 
